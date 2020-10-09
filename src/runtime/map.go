@@ -103,6 +103,7 @@ const (
 	sameSizeGrow = 8 // the current map growth is to a new map of the same size
 
 	// sentinel bucket ID for iterator checks
+	// 2^63
 	noCheck = 1<<(8*sys.PtrSize) - 1
 )
 
@@ -182,6 +183,9 @@ type hiter struct {
 // bucketShift returns 1<<b, optimized for code generation.
 func bucketShift(b uint8) uintptr {
 	// Masking the shift amount allows overflow checks to be elided.
+	// uintptr(1) << (b & (8*8 - 1))
+	// == uintptr(1) << (b & 0x3f)
+	// b最大不能超过63，也就是说map中元素的数量最多是 2^63个
 	return uintptr(1) << (b & (sys.PtrSize*8 - 1))
 }
 
@@ -289,6 +293,7 @@ func makemap64(t *maptype, hint int64, h *hmap) *hmap {
 // makemap_small implements Go map creation for make(map[k]v) and
 // make(map[k]v, hint) when hint is known to be at most bucketCnt
 // at compile time and the map needs to be allocated on the heap.
+// 在makemap_small中只创建了一个hmap实力并初始化了hash0，并没有创建bucket链表
 func makemap_small() *hmap {
 	h := new(hmap)
 	h.hash0 = fastrand()
@@ -300,6 +305,9 @@ func makemap_small() *hmap {
 // can be created on the stack, h and/or bucket may be non-nil.
 // If h != nil, the map can be created directly in h.
 // If h.buckets != nil, bucket pointed to can be used as the first bucket.
+// 如果编译器确定可以在堆栈上创建映射或第一个存储桶，则h和/或存储桶可以为非nil。
+// 如果 h != nil, 则可以直接在h上创建map
+// 如果 h.buckets != nil, 则被指向的bucket可以被用作第一个bucket
 func makemap(t *maptype, hint int, h *hmap) *hmap {
 	mem, overflow := math.MulUintptr(uintptr(hint), t.bucket.size)
 	if overflow || mem > maxAlloc {
@@ -315,6 +323,8 @@ func makemap(t *maptype, hint int, h *hmap) *hmap {
 	// Find the size parameter B which will hold the requested # of elements.
 	// For hint < 0 overLoadFactor returns false since hint < bucketCnt.
 	B := uint8(0)
+	// 通过循环的方式找到B的最小值，即找到能存下hint个元素的最小值
+	// B的值<=63
 	for overLoadFactor(hint, B) {
 		B++
 	}
@@ -569,27 +579,36 @@ func mapaccess2_fat(t *maptype, h *hmap, key, zero unsafe.Pointer) (unsafe.Point
 
 // Like mapaccess, but allocates a slot for the key if it is not present in the map.
 func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
+	// 判断map是否初始化，如果没有初始化就报错
 	if h == nil {
 		panic(plainError("assignment to entry in nil map"))
 	}
+
+	// 是否启用竞态检测
 	if raceenabled {
 		callerpc := getcallerpc()
 		pc := funcPC(mapassign)
 		racewritepc(unsafe.Pointer(h), callerpc, pc)
 		raceReadObjectPC(t.key, key, callerpc, pc)
 	}
+	// 启用与内存消毒器的互操作
 	if msanenabled {
 		msanread(key, t.key.size)
 	}
+	// 判断map的读写标志当前状态是否为写，如果当前标志是写，则表示map当前正进行写操作
 	if h.flags&hashWriting != 0 {
 		throw("concurrent map writes")
 	}
+	// 计算key的哈希值
 	hash := t.hasher(key, uintptr(h.hash0))
 
 	// Set hashWriting after calling t.hasher, since t.hasher may panic,
 	// in which case we have not actually done a write.
+	// 由于hasher可能引起panic，而此时我们实际上尚未完成一次写操作，
+	// 故在调用hasher之后将设置flag为写状态
 	h.flags ^= hashWriting
 
+	// bucket链为空表示是个空map，所以需要先申请一个bucket
 	if h.buckets == nil {
 		h.buckets = newobject(t.bucket) // newarray(t.bucket, 1)
 	}
@@ -1068,6 +1087,8 @@ func hashGrow(t *maptype, h *hmap) {
 
 // overLoadFactor reports whether count items placed in 1<<B buckets is over loadFactor.
 func overLoadFactor(count int, B uint8) bool {
+	// count > 8 && uintptr(count) > 6.5 * 2^B (B<=63)
+	// 由于count的值总是和B的值相关联，所以当B的值大于63时此方法总是返回false
 	return count > bucketCnt && uintptr(count) > loadFactorNum*(bucketShift(B)/loadFactorDen)
 }
 
